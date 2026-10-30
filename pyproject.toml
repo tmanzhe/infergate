@@ -1,13 +1,29 @@
 [project]
 name = "infergate"
 version = "0.1.0"
-description = "Add your description here"
+description = "An OpenAI-compatible gateway with cost logging and exact-match caching"
 readme = "README.md"
 authors = [
     { name = "Truman Chan", email = "97918794+tmanzhe@users.noreply.github.com" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "fastapi>=0.115,<1",
+    "httpx>=0.28,<1",
+    "psycopg[binary]>=3.2,<4",
+    "uvicorn>=0.34,<1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8,<10",
+    "pytest-asyncio>=0.25,<2",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 
 [project.scripts]
 infergate = "infergate:main"
