@@ -48,6 +48,13 @@ class Database:
                     status INTEGER NOT NULL
                 )
             """).format(self.table("request_logs")))
+            # Existing installations retain their unattributed historical rows.
+            await conn.execute(sql.SQL(
+                "ALTER TABLE {} ADD COLUMN IF NOT EXISTS api_key_hash TEXT"
+            ).format(self.table("request_logs")))
+            await conn.execute(sql.SQL(
+                "CREATE INDEX IF NOT EXISTS request_logs_api_key_hash_idx ON {} (api_key_hash)"
+            ).format(self.table("request_logs")))
             await conn.execute(sql.SQL("""
                 CREATE TABLE IF NOT EXISTS {} (
                     cache_key TEXT PRIMARY KEY,
@@ -96,14 +103,15 @@ class Database:
         latency_ms: float,
         cache_hit: bool,
         status: int,
+        api_key_hash: str | None = None,
     ) -> None:
         async with self.connection() as conn:
             await conn.execute(
                 sql.SQL("""
                     INSERT INTO {} (timestamp, model, prompt_tokens, completion_tokens,
-                                    cost_usd, latency_ms, cache_hit, status)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                                    cost_usd, latency_ms, cache_hit, status, api_key_hash)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """).format(self.table("request_logs")),
                 (timestamp, model, prompt_tokens, completion_tokens,
-                 cost_usd, latency_ms, cache_hit, status),
+                 cost_usd, latency_ms, cache_hit, status, api_key_hash),
             )

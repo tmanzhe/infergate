@@ -13,8 +13,13 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
 from infergate.cache import cache_key
+from infergate.concurrency import ConcurrencyLimiter
 from infergate.config import Settings
 from infergate.database import CachedResponse, Database
+from infergate.errors import error_response
+from infergate.identity import bearer_key, key_hash
+from infergate.retries import Attempt, send_attempt, with_retries
+from infergate.spend import SpendBudget
 from infergate.upstream import mock_completion
 
 
@@ -38,13 +43,6 @@ def usage_tokens(body: bytes) -> tuple[int, int]:
     return count("prompt_tokens"), count("completion_tokens")
 
 
-def error_response(message: str, status: int) -> JSONResponse:
-    return JSONResponse(
-        {"error": {"message": message, "type": "gateway_error", "code": None}},
-        status_code=status,
-    )
-
-
 def create_app(
     settings: Settings | None = None,
     *,
@@ -53,6 +51,7 @@ def create_app(
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     database = Database(settings.database_url, settings.database_schema)
+    limiter = ConcurrencyLimiter(settings.max_in_flight_per_key)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -75,8 +74,16 @@ def create_app(
         started = time.perf_counter()
         timestamp = clock()
         model = ""
+        api_key = bearer_key(request.headers.get("authorization", ""))
+        api_key_hash = key_hash(api_key)
 
-        async def finish(response: Response, *, cache_hit: bool = False) -> Response:
+        async def finish(
+            response: Response,
+            *,
+            cache_hit: bool = False,
+            log_timestamp: datetime = timestamp,
+            log_started: float = started,
+        ) -> Response:
             prompt_tokens, completion_tokens = usage_tokens(response.body)
             cost = Decimal(0)
             price = settings.model_prices.get(model)
@@ -85,14 +92,15 @@ def create_app(
                     prompt_tokens * price.prompt + completion_tokens * price.completion
                 ) / Decimal(1_000_000)
             await database.log_request(
-                timestamp=timestamp,
+                timestamp=log_timestamp,
                 model=model,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 cost_usd=cost,
-                latency_ms=(time.perf_counter() - started) * 1000,
+                latency_ms=(time.perf_counter() - log_started) * 1000,
                 cache_hit=cache_hit,
                 status=response.status_code,
+                api_key_hash=api_key_hash,
             )
             return response
 
@@ -108,37 +116,56 @@ def create_app(
         except (ValueError, UnicodeDecodeError):
             return await finish(error_response("Request body must be a valid JSON object.", 400))
 
-        if settings.cache_ttl_seconds > 0:
-            cached = await database.get_cached(key, clock())
-            if cached is not None:
-                headers = {"content-type": cached.content_type} if cached.content_type else {}
-                return await finish(
-                    Response(cached.body, status_code=cached.status, headers=headers), cache_hit=True
-                )
+        with limiter.acquire(api_key_hash) as admitted:
+            if not admitted:
+                response = error_response("API key concurrency limit reached. Try again shortly.", 429)
+                response.headers["Retry-After"] = "1"
+                return await finish(response)
 
-        if settings.mock_model:
-            response = JSONResponse(mock_completion(body))
-        else:
-            try:
-                upstream = await app.state.upstream.post(
-                    f"{settings.upstream_base_url.rstrip('/')}/chat/completions",
-                    content=raw_body,
-                    headers={"Content-Type": "application/json"},
-                )
-            except httpx.TimeoutException:
-                return await finish(error_response("Upstream request timed out.", 504))
-            except httpx.RequestError:
-                return await finish(error_response("Unable to reach upstream API.", 502))
-            headers = {"content-type": upstream.headers["content-type"]} if "content-type" in upstream.headers else {}
-            response = Response(upstream.content, status_code=upstream.status_code, headers=headers)
+            budget = SpendBudget(database, api_key_hash, settings.spend_caps_usd.get(api_key))
+            async with budget.guard():
+                if await budget.exhausted():
+                    return await finish(error_response("API key USD spend cap reached.", 402))
 
-        if settings.cache_ttl_seconds > 0 and 200 <= response.status_code < 300:
-            await database.put_cached(
-                key,
-                CachedResponse(response.body, response.status_code, response.headers.get("content-type")),
-                clock() + timedelta(seconds=settings.cache_ttl_seconds),
-            )
-        return await finish(response)
+                if settings.cache_ttl_seconds > 0:
+                    cached = await database.get_cached(key, clock())
+                    if cached is not None:
+                        headers = {"content-type": cached.content_type} if cached.content_type else {}
+                        return await finish(
+                            Response(cached.body, status_code=cached.status, headers=headers), cache_hit=True
+                        )
+
+                if settings.mock_model:
+                    response = JSONResponse(mock_completion(body))
+                else:
+                    async def attempt() -> Attempt:
+                        # Failed attempts can carry usage and consume the remaining budget.
+                        if await budget.exhausted():
+                            return Attempt(await finish(error_response("API key USD spend cap reached.", 402)))
+                        attempt_started = time.perf_counter()
+                        attempt_timestamp = clock()
+                        result = await send_attempt(
+                            app.state.upstream,
+                            f"{settings.upstream_base_url.rstrip('/')}/chat/completions",
+                            raw_body,
+                        )
+                        await finish(
+                            result.response,
+                            log_timestamp=attempt_timestamp,
+                            log_started=attempt_started,
+                        )
+                        return result
+
+                    response = await with_retries(attempt, settings)
+
+                if settings.cache_ttl_seconds > 0 and 200 <= response.status_code < 300:
+                    await database.put_cached(
+                        key,
+                        CachedResponse(response.body, response.status_code, response.headers.get("content-type")),
+                        clock() + timedelta(seconds=settings.cache_ttl_seconds),
+                    )
+                # Real upstream attempts have each already been accounted for.
+                return await finish(response) if settings.mock_model else response
 
     return app
 
