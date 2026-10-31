@@ -147,6 +147,37 @@ the same successful token usage on the expensive model for all 200 requests,
 without caching. Latencies cover both phases and vary by machine. They exclude
 network and Postgres overhead. All calls and costs are simulated.
 
+## Fair scheduling experiment
+
+```bash
+uv run --no-env-file python scripts/fair_loadtest.py
+```
+
+Inspired by [Cohere's serving fairness post](https://cohere.com/blog/serving-fairness).
+This standalone mock compares one FIFO queue with per-tenant FIFO queues and
+weighted deficit round robin. Each round grants 100 tokens times the tenant's
+weight; each request spends its estimated tokens. Idle tenants drop unused credit.
+`FairQueue(weights={"noisy": 2})` gives that tenant twice the token budget.
+The gateway's HTTP path does not use this scheduler.
+
+The default burst queues 1,000 noisy requests first, then 20 from each small
+tenant, all at time zero. All weights are 1. Request sizes cycle through
+50/100/150/200 tokens. Four mock workers each process 1,000 tokens/second.
+
+| Tenant | Requests | FIFO p50 / p95 (ms) | Fair p50 / p95 (ms) |
+| --- | --- | --- | --- |
+| noisy | 1,000 | 15,650 / 29,700 | 17,500 / 31,600 |
+| small-1 | 20 | 31,600 / 31,900 | 1,150 / 2,300 |
+| small-2 | 20 | 32,200 / 32,500 | 1,150 / 2,300 |
+| small-3 | 20 | 32,850 / 33,150 | 1,150 / 2,300 |
+
+Both finish 1,060 requests in 33.2 simulated seconds: **31.928 requests/second**
+for FIFO and fair. Small tenants finish sooner; the noisy tenant waits longer.
+These are deterministic simulated completion latencies, including queue wait,
+using nearest-rank percentiles. Worker time equals estimated tokens divided by
+token rate. Scheduling overhead, batching, and estimation errors aren't modeled.
+No server, Postgres, keys, or API calls. Cost: $0.
+
 ## Tests
 
 ```bash
