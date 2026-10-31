@@ -51,9 +51,10 @@ def create_app(
     *,
     upstream_transport: httpx.AsyncBaseTransport | None = None,
     clock: Callable[[], datetime] = utc_now,
+    database: Database | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
-    database = Database(settings.database_url, settings.database_schema)
+    database = database if database is not None else Database(settings.database_url, settings.database_schema)
     limiter = ConcurrencyLimiter(settings.max_in_flight_per_key)
     model_limiters = {
         model: ConcurrencyLimiter(maximum)
