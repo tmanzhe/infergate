@@ -78,6 +78,38 @@ The cache hashes sorted, compact JSON of the request, ignoring `user`, `stream`,
 expanded. Upstream bodies and status codes pass through, including errors;
 transport failures return 502 and timeouts return 504.
 
+## Mock load test
+
+```bash
+uv run --no-env-file python scripts/loadtest.py
+```
+
+No keys, server or Postgres needed. This drives the gateway in process with a fake
+upstream and an in-memory cache/log store. It prints JSON. Add
+`--requests 20 --concurrency 3 --latency-scale 0` for a quick smoke run.
+
+The default sends 100 unique prompts, then 100 replays, at concurrency 10.
+Every fifth unique prompt gets a short cheap answer and falls back. Fake delays
+are 180-260 ms for cheap and 650-950 ms for expensive. Usage varies from 800-1,600
+prompt tokens and 160-280 output tokens; rejected answers bill one output token.
+Illustrative prices per million prompt/output tokens are $0.15/$0.60 for cheap
+and $2.50/$10.00 for expensive.
+
+One measured run took 4.54 seconds:
+
+| Metric | Result |
+| --- | --- |
+| Cache hits | 100/200 (50%) |
+| Final route, including cache hits | 80% cheap, 20% fallback |
+| Client latency p50 / p99 | 0.73 / 1,133.68 ms |
+| Simulated cost / always expensive | $0.112572 / $1.040000 |
+| USD saved | $0.927428 (89.18%) |
+
+Costs include all 100 cheap attempts and 20 fallback attempts. The baseline uses
+the same successful token usage on the expensive model for every request, without
+caching. Latencies include both phases and vary by machine; they exclude network
+and Postgres overhead. No real API calls or charges.
+
 ## Tests
 
 ```bash
