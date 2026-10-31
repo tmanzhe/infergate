@@ -27,7 +27,9 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 ```
 
 Clients can point their OpenAI base URL at `http://127.0.0.1:8000/v1`.
-Only non-streaming requests are supported; `stream=true` returns HTTP 400.
+`stream=true` passes SSE chunks through as they arrive and bypasses the cache.
+Usage is logged once at stream end (also on disconnect/error), using upstream
+usage events when provided; retries/fallback stop once streaming begins.
 
 | Environment variable | Default / meaning |
 | --- | --- |
