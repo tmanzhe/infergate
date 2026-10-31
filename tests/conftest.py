@@ -9,6 +9,7 @@ import pytest
 from psycopg import sql
 from psycopg.rows import dict_row
 
+from infergate import retries
 from infergate.app import create_app
 from infergate.config import Settings
 
@@ -93,3 +94,22 @@ def completion():
         }],
         "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
     }
+
+
+@pytest.fixture
+def retry_timing(monkeypatch):
+    """Observe full-jitter backoff without sleeping or changing global asyncio."""
+    windows = []
+    delays = []
+
+    def jitter(lower, upper):
+        windows.append((lower, upper))
+        fraction = (0.25, 0.75)[(len(windows) - 1) % 2]
+        return lower + (upper - lower) * fraction
+
+    async def sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(retries, "uniform", jitter)
+    monkeypatch.setattr(retries, "sleep", sleep)
+    return windows, delays
