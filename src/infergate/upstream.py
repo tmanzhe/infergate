@@ -28,3 +28,17 @@ def mock_completion(request: dict[str, Any]) -> dict[str, Any]:
             "total_tokens": prompt_tokens + completion_tokens,
         },
     }
+
+
+def mock_stream(request: dict[str, Any]) -> bytes:
+    completion = mock_completion(request)
+    base = {name: completion[name] for name in ("id", "created", "model")}
+    base["object"] = "chat.completion.chunk"
+    events = [
+        {**base, "choices": [{"index": 0, "delta": {
+            "role": "assistant", "content": completion["choices"][0]["message"]["content"],
+        }, "finish_reason": None}]},
+        {**base, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+        {**base, "choices": [], "usage": completion["usage"]},
+    ]
+    return b"".join(b"data: " + json.dumps(event).encode() + b"\n\n" for event in events) + b"data: [DONE]\n\n"

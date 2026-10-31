@@ -1,4 +1,4 @@
-"""Non-streaming OpenAI-compatible chat proxy with Postgres cache and accounting."""
+"""OpenAI-compatible chat proxy with Postgres cache and accounting."""
 
 import json
 import time
@@ -22,6 +22,7 @@ from infergate.identity import bearer_key, key_hash
 from infergate.retries import Attempt, send_attempt, with_retries
 from infergate.routing import fails_quality, should_fallback
 from infergate.spend import SpendBudget
+from infergate.streaming import streaming_response
 from infergate.upstream import mock_completion
 
 
@@ -90,17 +91,19 @@ def create_app(
             cache_hit: bool = False,
             log_timestamp: datetime = timestamp,
             log_started: float = started,
+            log_model: str | None = None,
         ) -> Response:
             prompt_tokens, completion_tokens = usage_tokens(response.body)
             cost = Decimal(0)
-            price = settings.model_prices.get(model)
+            actual_model = model if log_model is None else log_model
+            price = settings.model_prices.get(actual_model)
             if price is not None and not cache_hit and not settings.mock_model:
                 cost = (
                     prompt_tokens * price.prompt + completion_tokens * price.completion
                 ) / Decimal(1_000_000)
             await database.log_request(
                 timestamp=log_timestamp,
-                model=model,
+                model=actual_model,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 cost_usd=cost,
@@ -117,14 +120,20 @@ def create_app(
             if not isinstance(body, dict):
                 raise ValueError("Request body must be a JSON object")
             model = body.get("model") if isinstance(body.get("model"), str) else ""
-            if body.get("stream"):
-                return await finish(error_response("Streaming is not supported; set stream=false.", 400))
             route = settings.model_routes.get(model)
             key = cache_key(body)
             if route:
                 key = "route:" + cache_key({"request_key": key, "route": asdict(route)})
         except (ValueError, UnicodeDecodeError):
             return await finish(error_response("Request body must be a valid JSON object.", 400))
+
+        if body.get("stream"):
+            return streaming_response(
+                settings=settings, database=database, client=app.state.upstream,
+                limiter=limiter, model_limiters=model_limiters, unlimited=unlimited,
+                api_key=api_key, api_key_hash=api_key_hash, body=body, raw_body=raw_body,
+                model=model, route=route, finish=finish, clock=clock,
+            )
 
         with limiter.acquire(api_key_hash) as admitted:
             if not admitted:

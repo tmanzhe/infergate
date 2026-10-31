@@ -146,13 +146,14 @@ async def test_equivalent_requests_share_cached_response(client_factory, rows, c
     assert [row["cache_hit"] for row in rows()] == [False, True, False]
 
 
-async def test_streaming_rejected_even_when_cached(client_factory, rows, chat_request):
+async def test_streaming_bypasses_cached_json(client_factory, rows, chat_request):
     async with client_factory(mock_model=True) as client:
         assert (await client.post(PATH, json=chat_request)).status_code == 200
         response = await client.post(PATH, json={**chat_request, "stream": True})
-    assert response.status_code == 400
-    assert "stream" in response.json()["error"]["message"].lower()
-    assert rows()[-1]["status"] == 400
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "text/event-stream"
+    assert response.content.endswith(b"data: [DONE]\n\n")
+    assert rows()[-1]["status"] == 200
     assert rows()[-1]["cache_hit"] is False
     assert len(rows("response_cache")) == 1
 

@@ -423,6 +423,8 @@ async def test_mock_routing_is_network_free_and_logs_zero_cost(
         cached = await client.post(PATH, json=request_body(chat_request))
         streaming = await client.post(PATH, json={**request_body(chat_request), "stream": True})
     assert first.json()["model"] == cached.json()["model"] == STRONG
-    assert streaming.status_code == 400
-    assert [row["model"] for row in rows()] == [CHEAP, STRONG, STRONG, "auto"]
+    assert streaming.status_code == 200
+    assert streaming.headers["content-type"] == "text/event-stream"
+    assert streaming.content.endswith(b"data: [DONE]\n\n")
+    assert [row["model"] for row in rows()] == [CHEAP, STRONG, STRONG, CHEAP]
     assert all(row["cost_usd"] == 0 for row in rows())
