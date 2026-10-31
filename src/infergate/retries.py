@@ -1,9 +1,9 @@
 """Retry only upstream throttling, server errors, and timeouts."""
 
-import asyncio
-import random
+from asyncio import sleep
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from random import uniform
 
 import httpx
 from fastapi.responses import Response
@@ -45,5 +45,5 @@ async def with_retries(attempt: Callable[[], Awaitable[Attempt]], settings: Sett
             settings.upstream_retry_max_seconds,
             settings.upstream_retry_base_seconds * 2**number,
         )
-        await asyncio.sleep(random.uniform(0, ceiling))
+        await sleep(uniform(0, ceiling))
     raise AssertionError("Validated max attempts must be positive")
