@@ -7,7 +7,8 @@ you try it without calling a model API.
 ## Quickstart
 
 You'll need Python 3.12+, [uv](https://docs.astral.sh/uv/), and Postgres
-(tested with Postgres 17). Create the database with `createdb -U postgres infergate`.
+(tested with Postgres 17). If the database doesn't exist yet, create it with
+`createdb -h localhost -U postgres infergate`.
 Tables are created at startup; existing tables are kept.
 
 ```bash
