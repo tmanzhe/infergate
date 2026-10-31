@@ -51,6 +51,21 @@ and `mock-model` (1.00 / 2.00). Set prices to match your upstream contract.
 Unknown models and responses without usage log zero cost; cache hits always log
 zero cost while retaining the original response's token counts.
 
+Optional routing config (send `"model":"auto"`; keep `MOCK_MODEL=true` for a free demo):
+
+```bash
+export MODEL_ROUTES='{"auto":{"cheap_model":"gpt-4o-mini","strong_model":"gpt-4o","min_output_chars":8}}'
+export MODEL_SPEND_CAPS_USD='{"gpt-4o-mini":0.50}'
+export MAX_IN_FLIGHT_PER_MODEL='{"gpt-4o-mini":2}'
+```
+
+Routes try cheap first, then strong once after retries. `fallback_on_error`,
+`fallback_on_quality`, and `fallback_on_limit` default to `true`; quality checks
+empty/short/refusal output (`min_output_chars` defaults to `1`, `refusal_prefixes`
+is configurable). Model caps use lifetime logged USD across callers and can
+overshoot by one attempt; model concurrency is per process (`0` means unlimited).
+Existing `SPEND_CAPS_USD` caller caps and `MAX_IN_FLIGHT_PER_KEY` always apply.
+
 `request_logs` records timestamp, model, prompt/completion tokens, USD cost,
 latency in milliseconds (through cache persistence, before the log write), cache
 hit, and HTTP status. `response_cache` stores successful (2xx) bodies with expiry.
