@@ -28,6 +28,35 @@ def default_prices() -> dict[str, ModelPrice]:
 
 
 @dataclass(frozen=True)
+class ModelRoute:
+    cheap_model: str
+    strong_model: str
+    fallback_on_error: bool = True
+    fallback_on_quality: bool = True
+    fallback_on_limit: bool = True
+    min_output_chars: int = 1
+    refusal_prefixes: tuple[str, ...] = (
+        "i cannot", "i can't", "i'm sorry", "i’m sorry", "i am sorry", "sorry, i",
+    )
+
+    def __post_init__(self) -> None:
+        if any(not isinstance(model, str) or not model.strip()
+               for model in (self.cheap_model, self.strong_model)):
+            raise ValueError("MODEL_ROUTES requires non-empty cheap_model and strong_model")
+        if self.cheap_model == self.strong_model:
+            raise ValueError("MODEL_ROUTES models must be different")
+        for flag in (self.fallback_on_error, self.fallback_on_quality, self.fallback_on_limit):
+            if type(flag) is not bool:
+                raise ValueError("MODEL_ROUTES fallback flags must be booleans")
+        if type(self.min_output_chars) is not int or self.min_output_chars < 0:
+            raise ValueError("MODEL_ROUTES min_output_chars must be a non-negative integer")
+        if not isinstance(self.refusal_prefixes, (list, tuple)) or any(
+            not isinstance(prefix, str) or not prefix.strip() for prefix in self.refusal_prefixes
+        ):
+            raise ValueError("MODEL_ROUTES refusal_prefixes must be a list of non-empty strings")
+
+
+@dataclass(frozen=True)
 class Settings:
     database_url: str = "postgresql://postgres@localhost:5432/infergate"
     database_schema: str = "public"
@@ -41,6 +70,9 @@ class Settings:
     upstream_retry_base_seconds: float = 0.25
     upstream_retry_max_seconds: float = 5
     spend_caps_usd: dict[str, Decimal] = field(default_factory=dict)
+    model_routes: dict[str, ModelRoute] = field(default_factory=dict)
+    model_spend_caps_usd: dict[str, Decimal] = field(default_factory=dict)
+    max_in_flight_per_model: dict[str, int] = field(default_factory=dict)
     model_prices: dict[str, ModelPrice] = field(default_factory=default_prices)
 
     def __post_init__(self) -> None:
@@ -66,6 +98,16 @@ class Settings:
         for key, cap in self.spend_caps_usd.items():
             if not isinstance(key, str) or not cap.is_finite() or cap < 0:
                 raise ValueError("SPEND_CAPS_USD must map API keys to finite non-negative USD amounts")
+        for model, route in self.model_routes.items():
+            if not isinstance(model, str) or not model.strip() or not isinstance(route, ModelRoute):
+                raise ValueError("MODEL_ROUTES must map model names or aliases to ModelRoute values")
+        for model, cap in self.model_spend_caps_usd.items():
+            if not isinstance(model, str) or not model.strip() or not cap.is_finite() or cap < 0:
+                raise ValueError("MODEL_SPEND_CAPS_USD must map models to finite non-negative USD amounts")
+        for model, maximum in self.max_in_flight_per_model.items():
+            if (not isinstance(model, str) or not model.strip()
+                    or type(maximum) is not int or maximum < 0):
+                raise ValueError("MAX_IN_FLIGHT_PER_MODEL must map models to non-negative integers")
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -90,5 +132,14 @@ class Settings:
                 key: Decimal(str(cap))
                 for key, cap in json.loads(os.getenv("SPEND_CAPS_USD", "{}")).items()
             },
+            model_routes={
+                model: ModelRoute(**route)
+                for model, route in json.loads(os.getenv("MODEL_ROUTES", "{}")).items()
+            },
+            model_spend_caps_usd={
+                model: Decimal(str(cap))
+                for model, cap in json.loads(os.getenv("MODEL_SPEND_CAPS_USD", "{}")).items()
+            },
+            max_in_flight_per_model=json.loads(os.getenv("MAX_IN_FLIGHT_PER_MODEL", "{}")),
             model_prices=prices,
         )

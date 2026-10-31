@@ -15,6 +15,7 @@ class CachedResponse:
     body: bytes
     status: int
     content_type: str | None
+    model: str | None = None
 
 
 class Database:
@@ -55,6 +56,9 @@ class Database:
             await conn.execute(sql.SQL(
                 "CREATE INDEX IF NOT EXISTS request_logs_api_key_hash_idx ON {} (api_key_hash)"
             ).format(self.table("request_logs")))
+            await conn.execute(sql.SQL(
+                "CREATE INDEX IF NOT EXISTS request_logs_model_idx ON {} (model)"
+            ).format(self.table("request_logs")))
             await conn.execute(sql.SQL("""
                 CREATE TABLE IF NOT EXISTS {} (
                     cache_key TEXT PRIMARY KEY,
@@ -64,12 +68,15 @@ class Database:
                     expires_at TIMESTAMPTZ NOT NULL
                 )
             """).format(self.table("response_cache")))
+            await conn.execute(sql.SQL(
+                "ALTER TABLE {} ADD COLUMN IF NOT EXISTS model TEXT"
+            ).format(self.table("response_cache")))
 
     async def get_cached(self, key: str, now: datetime) -> CachedResponse | None:
         async with self.connection() as conn:
             cursor = await conn.execute(
                 sql.SQL("""
-                    SELECT response_body, status, content_type FROM {}
+                    SELECT response_body, status, content_type, model FROM {}
                     WHERE cache_key = %s AND expires_at > %s
                 """).format(self.table("response_cache")),
                 (key, now),
@@ -81,15 +88,16 @@ class Database:
         async with self.connection() as conn:
             await conn.execute(
                 sql.SQL("""
-                    INSERT INTO {} (cache_key, response_body, status, content_type, expires_at)
-                    VALUES (%s, %s, %s, %s, %s)
+                    INSERT INTO {} (cache_key, response_body, status, content_type, expires_at, model)
+                    VALUES (%s, %s, %s, %s, %s, %s)
                     ON CONFLICT (cache_key) DO UPDATE SET
                         response_body = EXCLUDED.response_body,
                         status = EXCLUDED.status,
                         content_type = EXCLUDED.content_type,
-                        expires_at = EXCLUDED.expires_at
+                        expires_at = EXCLUDED.expires_at,
+                        model = EXCLUDED.model
                 """).format(self.table("response_cache")),
-                (key, response.body, response.status, response.content_type, expires_at),
+                (key, response.body, response.status, response.content_type, expires_at, response.model),
             )
 
     async def log_request(

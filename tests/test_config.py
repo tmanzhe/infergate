@@ -2,7 +2,7 @@ from decimal import Decimal
 
 import pytest
 
-from infergate.config import ModelPrice, Settings
+from infergate.config import ModelPrice, ModelRoute, Settings
 
 
 def test_environment_configuration(monkeypatch):
@@ -33,3 +33,45 @@ def test_invalid_ttl(ttl):
 def test_invalid_prices(price):
     with pytest.raises(ValueError, match="Model prices"):
         ModelPrice(Decimal(price), Decimal(0))
+
+
+def test_routing_environment_configuration(monkeypatch):
+    monkeypatch.setenv("MODEL_ROUTES", '{"auto":{"cheap_model":"cheap","strong_model":"strong",'
+                       '"fallback_on_error":false,"min_output_chars":20,"refusal_prefixes":["declined"]}}')
+    monkeypatch.setenv("MODEL_SPEND_CAPS_USD", '{"cheap":"0.05","strong":2}')
+    monkeypatch.setenv("MAX_IN_FLIGHT_PER_MODEL", '{"cheap":1,"strong":0}')
+    settings = Settings.from_env()
+    assert settings.model_routes == {"auto": ModelRoute("cheap", "strong", fallback_on_error=False,
+                                                        min_output_chars=20, refusal_prefixes=["declined"])}
+    assert settings.model_spend_caps_usd == {"cheap": Decimal("0.05"), "strong": Decimal(2)}
+    assert settings.max_in_flight_per_model == {"cheap": 1, "strong": 0}
+
+
+@pytest.mark.parametrize("options", [
+    {"cheap_model": ""}, {"strong_model": " "}, {"cheap_model": None},
+    {"strong_model": "cheap"}, {"fallback_on_error": "false"},
+    {"fallback_on_quality": 1}, {"fallback_on_limit": None},
+    {"min_output_chars": -1}, {"min_output_chars": True}, {"min_output_chars": 1.5},
+    {"refusal_prefixes": "refusal"}, {"refusal_prefixes": [""]}, {"refusal_prefixes": [None]},
+])
+def test_invalid_model_route(options):
+    with pytest.raises(ValueError, match="MODEL_ROUTES"):
+        ModelRoute(**{"cheap_model": "cheap", "strong_model": "strong", **options})
+
+
+@pytest.mark.parametrize("cap", ["-1", "NaN", "Infinity"])
+def test_invalid_model_spend_caps(cap):
+    with pytest.raises(ValueError, match="MODEL_SPEND_CAPS_USD"):
+        Settings(model_spend_caps_usd={"cheap": Decimal(cap)})
+
+
+@pytest.mark.parametrize("maximum", [-1, True, 0.5, "2"])
+def test_invalid_model_concurrency_limits(maximum):
+    with pytest.raises(ValueError, match="MAX_IN_FLIGHT_PER_MODEL"):
+        Settings(max_in_flight_per_model={"cheap": maximum})
+
+
+@pytest.mark.parametrize("routes", [{"": ModelRoute("cheap", "strong")}, {"auto": {}}])
+def test_invalid_route_map(routes):
+    with pytest.raises(ValueError, match="MODEL_ROUTES"):
+        Settings(model_routes=routes)
