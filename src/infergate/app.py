@@ -12,12 +12,14 @@ from typing import Any
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
+from starlette.requests import ClientDisconnect
 
 from infergate.cache import cache_key
 from infergate.concurrency import ConcurrencyLimiter
 from infergate.config import Settings
 from infergate.database import CachedResponse, Database
 from infergate.errors import error_response
+from infergate.fairgate import FairGate, GatedResponse, QueueFull
 from infergate.identity import bearer_key, key_hash
 from infergate.retries import Attempt, send_attempt, with_retries
 from infergate.routing import fails_quality, should_fallback
@@ -61,6 +63,9 @@ def create_app(
         for model, maximum in settings.max_in_flight_per_model.items()
     }
     unlimited = ConcurrencyLimiter(0)
+    fairgate = FairGate(
+        weights=settings.fairq_weights, slots=settings.fairq_slots, max_depth=settings.fairq_max_depth,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -77,6 +82,7 @@ def create_app(
     app = FastAPI(title="infergate", lifespan=lifespan)
     app.state.database = database
     app.state.settings = settings
+    app.state.fairgate = fairgate
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> Response:
@@ -128,94 +134,113 @@ def create_app(
         except (ValueError, UnicodeDecodeError):
             return await finish(error_response("Request body must be a valid JSON object.", 400))
 
-        if body.get("stream"):
-            return streaming_response(
-                settings=settings, database=database, client=app.state.upstream,
-                limiter=limiter, model_limiters=model_limiters, unlimited=unlimited,
-                api_key=api_key, api_key_hash=api_key_hash, body=body, raw_body=raw_body,
-                model=model, route=route, finish=finish, clock=clock,
-            )
+        async def process() -> Response:
+            nonlocal model
+            if body.get("stream"):
+                return streaming_response(
+                    settings=settings, database=database, client=app.state.upstream,
+                    limiter=limiter, model_limiters=model_limiters, unlimited=unlimited,
+                    api_key=api_key, api_key_hash=api_key_hash, body=body, raw_body=raw_body,
+                    model=model, route=route, finish=finish, clock=clock,
+                )
 
-        with limiter.acquire(api_key_hash) as admitted:
-            if not admitted:
-                response = error_response("API key concurrency limit reached. Try again shortly.", 429)
-                response.headers["Retry-After"] = "1"
-                return await finish(response)
+            with limiter.acquire(api_key_hash) as admitted:
+                if not admitted:
+                    response = error_response("API key concurrency limit reached. Try again shortly.", 429)
+                    response.headers["Retry-After"] = "1"
+                    return await finish(response)
 
-            budget = SpendBudget(database, api_key_hash, settings.spend_caps_usd.get(api_key))
-            async with budget.guard():
-                if await budget.exhausted():
-                    return await finish(error_response("API key USD spend cap reached.", 402))
-
-                if settings.cache_ttl_seconds > 0:
-                    cached = await database.get_cached(key, clock())
-                    if cached is not None:
-                        model = cached.model or model
-                        headers = {"content-type": cached.content_type} if cached.content_type else {}
-                        return await finish(
-                            Response(cached.body, status_code=cached.status, headers=headers), cache_hit=True
-                        )
-
-                async def run_model(target: str) -> tuple[Response, str | None]:
-                    nonlocal model
-                    model = target
+                budget = SpendBudget(database, api_key_hash, settings.spend_caps_usd.get(api_key))
+                async with budget.guard():
                     if await budget.exhausted():
-                        return await finish(error_response("API key USD spend cap reached.", 402)), "caller_cap"
-                    with model_limiters.get(model, unlimited).acquire(model) as model_admitted:
-                        if not model_admitted:
-                            limited = error_response("Model concurrency limit reached. Try again shortly.", 429)
-                            limited.headers["Retry-After"] = "1"
-                            return await finish(limited), "model_limit"
-                        model_budget = SpendBudget(
-                            database, api_key_hash, settings.model_spend_caps_usd.get(model), model=model
-                        )
-                        async with model_budget.guard():
-                            reason = None
-                            routed_body = {**body, "model": model} if route else body
-                            routed_raw = json.dumps(routed_body).encode() if route else raw_body
+                        return await finish(error_response("API key USD spend cap reached.", 402))
 
-                            async def attempt() -> Attempt:
-                                nonlocal reason
-                                # Each committed attempt can exhaust either budget.
-                                if await budget.exhausted():
-                                    reason = "caller_cap"
-                                    return Attempt(await finish(error_response("API key USD spend cap reached.", 402)))
-                                if await model_budget.exhausted():
-                                    reason = "model_limit"
-                                    return Attempt(await finish(error_response("Model USD spend cap reached.", 402)))
-                                attempt_started = time.perf_counter()
-                                attempt_timestamp = clock()
-                                if settings.mock_model:
-                                    result = Attempt(JSONResponse(mock_completion(routed_body)))
-                                else:
-                                    result = await send_attempt(
-                                        app.state.upstream,
-                                        f"{settings.upstream_base_url.rstrip('/')}/chat/completions",
-                                        routed_raw,
+                    if settings.cache_ttl_seconds > 0:
+                        cached = await database.get_cached(key, clock())
+                        if cached is not None:
+                            model = cached.model or model
+                            headers = {"content-type": cached.content_type} if cached.content_type else {}
+                            return await finish(
+                                Response(cached.body, status_code=cached.status, headers=headers), cache_hit=True
+                            )
+
+                    async def run_model(target: str) -> tuple[Response, str | None]:
+                        nonlocal model
+                        model = target
+                        if await budget.exhausted():
+                            return await finish(error_response("API key USD spend cap reached.", 402)), "caller_cap"
+                        with model_limiters.get(model, unlimited).acquire(model) as model_admitted:
+                            if not model_admitted:
+                                limited = error_response("Model concurrency limit reached. Try again shortly.", 429)
+                                limited.headers["Retry-After"] = "1"
+                                return await finish(limited), "model_limit"
+                            model_budget = SpendBudget(
+                                database, api_key_hash, settings.model_spend_caps_usd.get(model), model=model
+                            )
+                            async with model_budget.guard():
+                                reason = None
+                                routed_body = {**body, "model": model} if route else body
+                                routed_raw = json.dumps(routed_body).encode() if route else raw_body
+
+                                async def attempt() -> Attempt:
+                                    nonlocal reason
+                                    # Each committed attempt can exhaust either budget.
+                                    if await budget.exhausted():
+                                        reason = "caller_cap"
+                                        return Attempt(await finish(error_response("API key USD spend cap reached.", 402)))
+                                    if await model_budget.exhausted():
+                                        reason = "model_limit"
+                                        return Attempt(await finish(error_response("Model USD spend cap reached.", 402)))
+                                    attempt_started = time.perf_counter()
+                                    attempt_timestamp = clock()
+                                    if settings.mock_model:
+                                        result = Attempt(JSONResponse(mock_completion(routed_body)))
+                                    else:
+                                        result = await send_attempt(
+                                            app.state.upstream,
+                                            f"{settings.upstream_base_url.rstrip('/')}/chat/completions",
+                                            routed_raw,
+                                        )
+                                    await finish(
+                                        result.response,
+                                        log_timestamp=attempt_timestamp,
+                                        log_started=attempt_started,
                                     )
-                                await finish(
-                                    result.response,
-                                    log_timestamp=attempt_timestamp,
-                                    log_started=attempt_started,
-                                )
-                                return result
+                                    return result
 
-                            response = await with_retries(attempt, settings)
-                            return response, reason
+                                response = await with_retries(attempt, settings)
+                                return response, reason
 
-                response, reason = await run_model(route.cheap_model if route else model)
-                if route and should_fallback(response, route, reason):
-                    # Resolve exactly once; target names are never recursively routed.
-                    response, reason = await run_model(route.strong_model)
+                    response, reason = await run_model(route.cheap_model if route else model)
+                    if route and should_fallback(response, route, reason):
+                        # Resolve exactly once; target names are never recursively routed.
+                        response, reason = await run_model(route.strong_model)
 
-                acceptable = not (route and route.fallback_on_quality and fails_quality(response, route))
-                if settings.cache_ttl_seconds > 0 and 200 <= response.status_code < 300 and acceptable:
-                    await database.put_cached(
-                        key,
-                        CachedResponse(response.body, response.status_code, response.headers.get("content-type"), model),
-                        clock() + timedelta(seconds=settings.cache_ttl_seconds),
-                    )
-                return response
+                    acceptable = not (route and route.fallback_on_quality and fails_quality(response, route))
+                    if settings.cache_ttl_seconds > 0 and 200 <= response.status_code < 300 and acceptable:
+                        await database.put_cached(
+                            key,
+                            CachedResponse(response.body, response.status_code, response.headers.get("content-type"), model),
+                            clock() + timedelta(seconds=settings.cache_ttl_seconds),
+                        )
+                    return response
+
+        if not settings.fairq_enabled:
+            return await process()
+        # Cache hits queue too, before the existing concurrency and spend checks.
+        try:
+            slot = await fairgate.acquire(api_key, request.receive)
+        except QueueFull:
+            limited = error_response("Fair queue is full. Try again shortly.", 429)
+            limited.headers["Retry-After"] = "1"
+            return await finish(limited)
+        except ClientDisconnect:
+            return await finish(error_response("Client disconnected.", 499))
+        try:
+            return GatedResponse(await process(), slot)
+        except BaseException:
+            slot.release()
+            raise
 
     return app
 
