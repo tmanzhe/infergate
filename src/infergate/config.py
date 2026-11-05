@@ -74,8 +74,21 @@ class Settings:
     model_spend_caps_usd: dict[str, Decimal] = field(default_factory=dict)
     max_in_flight_per_model: dict[str, int] = field(default_factory=dict)
     model_prices: dict[str, ModelPrice] = field(default_factory=default_prices)
+    fairq_enabled: bool = True
+    fairq_weights: dict[str, int] = field(default_factory=lambda: {"default": 1})
+    fairq_max_depth: int = 1024
+    fairq_slots: int = 32
 
     def __post_init__(self) -> None:
+        if type(self.fairq_enabled) is not bool:
+            raise ValueError("FAIRQ_ENABLED must be a boolean")
+        for name, value in (("FAIRQ_MAX_DEPTH", self.fairq_max_depth), ("FAIRQ_SLOTS", self.fairq_slots)):
+            if type(value) is not int or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        for tenant, weight in self.fairq_weights.items():
+            if (not isinstance(tenant, str) or not tenant.strip()
+                    or type(weight) is not int or weight < 1):
+                raise ValueError("FAIRQ_WEIGHTS must map non-empty tenant names to positive integers")
         if not math.isfinite(self.cache_ttl_seconds) or self.cache_ttl_seconds < 0:
             raise ValueError("CACHE_TTL_SECONDS must be finite and non-negative")
         if (
@@ -142,4 +155,14 @@ class Settings:
             },
             max_in_flight_per_model=json.loads(os.getenv("MAX_IN_FLIGHT_PER_MODEL", "{}")),
             model_prices=prices,
+            fairq_enabled=os.getenv("FAIRQ_ENABLED", "true").lower() in {"1", "true", "yes", "on"},
+            fairq_weights={
+                tenant.strip(): int(weight)
+                for tenant, weight in (
+                    entry.split("=") for entry in os.getenv("FAIRQ_WEIGHTS", "default=1").split(",")
+                    if entry.strip()
+                )
+            },
+            fairq_max_depth=int(os.getenv("FAIRQ_MAX_DEPTH", "1024")),
+            fairq_slots=int(os.getenv("FAIRQ_SLOTS", "32")),
         )
