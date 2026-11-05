@@ -62,6 +62,12 @@ fallback, even on cache hits. Concurrency limits are per process; `0` means
 unlimited. Caller limits use the request's Bearer token, separate from the
 upstream key.
 
+The HTTP fair queue uses caller Bearer tokens as tenants, with unconfigured keys
+sharing `default`. Each request costs 100 units, and weights set the requests per
+DRR visit. Slots stay held until the response or full stream ends; queued
+disconnects free their place, and a full queue returns 429.
+Cache hits join the fair queue too, before concurrency and spend checks.
+
 ## Configuration
 
 | Environment variable | Default / meaning |
@@ -79,6 +85,10 @@ upstream key.
 | `MODEL_SPEND_CAPS_USD` | `{}`; model names mapped to USD caps |
 | `MAX_IN_FLIGHT_PER_KEY` | `0`; concurrent requests per caller |
 | `MAX_IN_FLIGHT_PER_MODEL` | `{}`; model names mapped to concurrency limits |
+| `FAIRQ_ENABLED` | `true`; enable the HTTP fair queue |
+| `FAIRQ_WEIGHTS` | `default=1`; tenant weights, e.g. `tenantA=3,default=1` |
+| `FAIRQ_MAX_DEPTH` | `1024`; maximum waiting requests per process |
+| `FAIRQ_SLOTS` | `32`; responses allowed through the queue at once per process |
 | `UPSTREAM_MAX_ATTEMPTS` | `1`; total attempts per model, from `1` to `10` |
 | `UPSTREAM_RETRY_BASE_SECONDS` | `0.25`; base delay for exponential backoff with jitter |
 | `UPSTREAM_RETRY_MAX_SECONDS` | `5`; maximum backoff delay |
@@ -159,7 +169,7 @@ This standalone mock compares one FIFO queue with per-tenant FIFO queues and
 weighted deficit round robin. Each round grants 100 tokens times the tenant's
 weight; each request spends its estimated tokens. Idle tenants drop unused credit.
 `FairQueue(weights={"noisy": 2})` gives that tenant twice the token budget.
-The gateway's HTTP path does not use this scheduler.
+The gateway's HTTP path uses the vendored version of this scheduler.
 
 The default burst queues 1,000 noisy requests first, then 20 from each small
 tenant, all at time zero. All weights are 1. Request sizes cycle through
